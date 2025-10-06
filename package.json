@@ -1,0 +1,83 @@
+{
+  "name": "commitguard",
+  "displayName": "CommitGuard - Enterprise Pre-Commit Setup",
+  "description": "Automates setup of pre-commit hooks for enterprise code quality and security standards",
+  "version": "1.0.0",
+  "publisher": "your-organization",
+  "engines": {
+    "vscode": "^1.104.0"
+  },
+  "categories": [
+    "Other",
+    "Linters",
+    "SCM Providers"
+  ],
+  "keywords": [
+    "pre-commit",
+    "git",
+    "hooks",
+    "security",
+    "code-quality",
+    "enterprise"
+  ],
+  "activationEvents": [
+    "onStartupFinished"
+  ],
+  "main": "./out/extension.js",
+  "contributes": {
+    "configuration": {
+      "title": "CommitGuard",
+      "properties": {
+        "commitGuard.precommitConfig": {
+          "type": "string",
+          "default": "",
+          "markdownDescription": "Custom pre-commit configuration content. Leave empty to use the default enterprise configuration. This should be valid YAML content for `.pre-commit-config.yaml`."
+        },
+        "commitGuard.autoSetupOnStartup": {
+          "type": "boolean",
+          "default": true,
+          "description": "Automatically setup pre-commit hooks when opening a workspace"
+        },
+        "commitGuard.showTerminalOnInstall": {
+          "type": "boolean",
+          "default": true,
+          "description": "Show the terminal when installing pre-commit hooks"
+        }
+      }
+    },
+    "commands": [
+      {
+        "command": "commitGuard.setupPreCommit",
+        "title": "CommitGuard: Setup Pre-Commit Hooks"
+      }
+    ]
+  },
+  "extensionDependencies": [],
+  "extensionPack": [
+    "redhat.vscode-yaml"
+  ],
+  "scripts": {
+    "vscode:prepublish": "npm run compile",
+    "compile": "tsc -p ./",
+    "watch": "tsc -watch -p ./",
+    "pretest": "npm run compile && npm run lint",
+    "lint": "eslint src",
+    "test": "vscode-test"
+  },
+  "devDependencies": {
+    "@types/vscode": "^1.104.0",
+    "@types/mocha": "^10.0.10",
+    "@types/node": "22.x",
+    "@typescript-eslint/eslint-plugin": "^8.45.0",
+    "@typescript-eslint/parser": "^8.45.0",
+    "eslint": "^9.36.0",
+    "typescript": "^5.9.3",
+    "@vscode/test-cli": "^0.0.11",
+    "@vscode/test-electron": "^2.5.2"
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/your-organization/commitguard"
+  },
+  "license": "MIT"
+}

@@ -1,3 +1,4 @@
+
 import * as vscode from 'vscode';
 import * as fs from 'fs/promises';
 import * as path from 'path';
@@ -31,33 +32,13 @@ interface PrerequisiteResult {
   installed: boolean;
   method: 'existing' | 'pip' | 'pip3' | 'python' | 'manual';
   message: string;
-  /** Optional absolute path to a pre-commit binary (e.g., from a temp venv). */
-  preCommitBinPath?: string;
-}
-
-/**
- * Python detection
- */
-interface PythonInfo {
-  available: boolean;
-  command: string; // e.g., "python3" or "python"
-  version?: string;
-}
-
-/**
- * Result of temporary virtual environment setup
- */
-interface VenvSetupResult {
-  success: boolean;
-  venvPath: string;
-  pythonBin: string;
-  pipBin: string;
-  preCommitBin?: string; // absolute path to pre-commit within venv
 }
 
 /**
  * Activates the CommitGuard extension
  * Sets up pre-commit hooks across all workspace folders on startup
+ *
+ * @param context - VS Code extension context
  */
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log('CommitGuard extension is now active');
@@ -92,8 +73,11 @@ export function deactivate(): void {
 
 /**
  * Orchestrates pre-commit setup across all workspace folders
+ *
+ * @param manualTrigger - Whether this was manually triggered by user
  */
 async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<void> {
+  // Check if we have any workspace folders
   const workspaceFolders = vscode.workspace.workspaceFolders;
   console.log(`CommitGuard: Found ${workspaceFolders?.length ?? 0} workspace folder(s)`);
 
@@ -104,7 +88,7 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
     return;
   }
 
-  // Step 1: Ensure pre-commit is available (best-effort)
+  // Step 1: Ensure pre-commit is available (best-effort, uses a temporary venv)
   console.log('CommitGuard: Checking for pre-commit installation...');
   const prereqResult = await vscode.window.withProgress(
     {
@@ -119,6 +103,7 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
   );
 
   if (!prereqResult.installed) {
+    // Provide enterprise-friendly guidance
     const contactITAction = 'Contact IT';
     const tryManualAction = 'Try Manual Install';
     const viewDocsAction = 'View Documentation';
@@ -128,6 +113,7 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
     const result = await vscode.window.showErrorMessage(message, ...actions);
 
     if (result === tryManualAction) {
+      // Open integrated terminal with manual install command
       const terminal = vscode.window.createTerminal('CommitGuard Setup');
       terminal.show();
       terminal.sendText('python -m pip install --user pre-commit');
@@ -153,7 +139,7 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
   // Step 2: Setup pre-commit for each workspace folder
   const results: SetupResult[] = [];
   for (const folder of workspaceFolders) {
-    const result = await setupPreCommitForWorkspace(folder, prereqResult.preCommitBinPath);
+    const result = await setupPreCommitForWorkspace(folder);
     results.push(result);
   }
 
@@ -162,32 +148,20 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
 }
 
 /**
- * Ensures pre-commit is installed, attempting automatic installation if needed.
- * 1) If `pre-commit` is on PATH -> 'existing'
- * 2) Else try temp venv -> 'python'
- * 3) Else try `python -m pip install --user pre-commit` -> 'pip'
+ * Ensures pre-commit is installed, attempting automatic installation if needed
+ * Tries multiple methods with focus on user-space installation for Windows
+ *
+ * @param progress - VS Code progress reporter for user feedback
+ * @returns Installation result with method used
  */
 async function ensurePreCommitInstalled(
   progress: vscode.Progress<{ message?: string; increment?: number }>
 ): Promise<PrerequisiteResult> {
-  // Check PATH for pre-commit
-  try {
-    const { stdout } = await execAsync(`pre-commit --version`);
-    if (stdout?.trim()) {
-      return {
-        installed: true,
-        method: 'existing',
-        message: `Using existing ${stdout.trim()}`,
-      };
-    }
-  } catch {
-    // not present -> continue
-  }
-
-  // Check Python (needed for venv/pip fallback)
+  // First check if Python is available since we'll need it for venv
   console.log('CommitGuard: Checking for Python...');
   progress.report({ message: 'Checking prerequisites...' });
   const pythonInfo = await getPythonInfo();
+
   if (!pythonInfo.available) {
     console.error('CommitGuard: Python not found on system');
     return {
@@ -198,112 +172,125 @@ async function ensurePreCommitInstalled(
     };
   }
 
-  // Try a temporary virtual environment (best-effort, isolated)
+  // Create a temporary workspace for installing pre-commit (best-effort)
   const tmpDir = path.join(os.tmpdir(), 'commitguard-setup');
   try {
     await fs.mkdir(tmpDir, { recursive: true });
-    progress.report({ message: 'Setting up a temporary virtual environment...' });
-    const venvSetup = await setupVirtualEnvironment(pythonInfo.command, tmpDir);
-    if (venvSetup.success && venvSetup.preCommitBin) {
-      progress.report({ message: 'Pre-commit installed in temporary environment' });
+
+    // Setup virtual environment in temp directory (installs pre-commit inside)
+    progress.report({ message: 'Setting up virtual environment...' });
+    const venvSetup = await setupVirtualEnvironment(tmpDir); // installs pre-commit inside
+    if (venvSetup.success) {
+      progress.report({ message: 'Pre-commit installed in virtual environment' });
       return {
         installed: true,
         method: 'python',
-        message: 'Successfully installed pre-commit in a temporary virtual environment',
-        preCommitBinPath: venvSetup.preCommitBin,
+        message: 'Successfully installed pre-commit in virtual environment',
       };
     }
   } catch (error) {
     console.error('CommitGuard: Virtual environment setup failed:', error);
-    // continue to pip --user fallback
   }
 
-  // Fallback to user-space installation (no admin required)
+  // If virtual environment approach failed, fall back to user-space installation (no admin required)
   progress.report({ message: 'Trying alternative installation methods...' });
+
   try {
-    console.log(`CommitGuard: Attempting user-space installation with ${pythonInfo.command}`);
-    progress.report({ message: 'Installing pre-commit (this may take 30–60 seconds)...' });
-    await execAsync(`"${pythonInfo.command}" -m pip install --user pre-commit`, { timeout: 120_000 });
-    return {
-      installed: true,
-      method: 'pip',
-      message: 'Installed pre-commit using pip --user',
-    };
-  } catch (pipError) {
-    console.warn('CommitGuard: pip install failed, retrying ensurepip and pip install');
-    try {
-      await execAsync(`"${pythonInfo.command}" -m ensurepip --upgrade`, { timeout: 60_000 });
-      await execAsync(`"${pythonInfo.command}" -m pip install --user pre-commit`, { timeout: 120_000 });
-      return {
-        installed: true,
-        method: 'pip',
-        message: 'Installed pre-commit after bootstrapping pip',
-      };
-    } catch (err: any) {
-      return {
-        installed: false,
-        method: 'manual',
-        message: `Automatic installation failed: ${err?.stderr ?? err?.message ?? String(err)}`,
-      };
-    }
+    const installCmd = `${pythonInfo.command} -m pip install --user pre-commit`;
+    console.log(`CommitGuard: Attempting user-space installation: ${installCmd}`);
+    progress.report({ message: 'Installing pre-commit (this may take 30-60 seconds)...' });
+    const result = try {
+    await execAsync(`"${pythonBin}" -m pip install pre-commit`, {
+        cwd: workspacePath,
+        timeout: 120000,
+    });
+} catch (pipError) {
+    console.warn("CommitGuard: pip install failed, retrying ensurepip and pip install");
+    await execAsync(`"${pythonBin}" -m ensurepip --upgrade`, {
+        cwd: workspacePath,
+        timeout: 60000,
+    });
+    await execAsync(`"${pythonBin}" -m pip install pre-commit`, {
+        cwd: workspacePath,
+        timeout: 120000,
+    });
+}
+
+    console.log('CommitGuard: pre-commit installed in virtual environment');
+
+    return { venvPath, pipPath, preCommitPath, activateCmd, success: true };
+  } catch (error) {
+    console.error('CommitGuard: Virtual environment setup failed:', error);
+    return { venvPath: '', pipPath: '', preCommitPath: '', activateCmd: '', success: false };
   }
 }
 
 /**
- * Per-workspace orchestration and safety checks.
- * Ensures a default .pre-commit-config.yaml exists (opinionated first-run).
+ * Installs pre-commit hooks with a two-phase strategy:
+ *   1) Always install the hook script ("install -t pre-commit") and verify its presence.
+ *   2) Best-effort warm up environments ("install-hooks -t pre-commit"); warn on failure but don't abort.
+ *
+ * @param workspaceFolder - The workspace folder where hooks should be installed
+ * @param preCommitPathFromVenv - Optional absolute path to pre-commit in the venv to ensure isolation
  */
-async function setupPreCommitForWorkspace(
-  workspaceFolder: vscode.WorkspaceFolder,
-  preCommitPathFromVenv?: string
-): Promise<SetupResult> {
-  const workspacePath = workspaceFolder.uri.fsPath;
+// async function installPreCommitHooks(
+//   workspaceFolder: vscode.WorkspaceFolder,
+//   preCommitPathFromVenv?: string
+// ): Promise<void> {
+//   try {
+//     const config = vscode.workspace.getConfiguration('commitGuard');
+//     const showTerminal = config.get<boolean>('showTerminalOnInstall', true);
+//     const workspacePath = workspaceFolder.uri.fsPath;
+//     const preCommitBin = preCommitPathFromVenv || 'pre-commit';
 
-  try {
-    // Ensure this is a Git repo
-    const gitDir = path.join(workspacePath, '.git');
-    if (!(await checkPathExists(gitDir))) {
-      return {
-        workspace: workspaceFolder.name,
-        success: false,
-        skipped: true,
-        message: 'Not a Git repository (.git folder not found)',
-      };
-    }
+//     // PHASE 1: install hook script only (reliable, fast)
+//     await execAsync(`"${preCommitBin}" install -t pre-commit`, {
+//       cwd: workspacePath,
+//       timeout: 120_000,
+//       env: { ...process.env, PRE_COMMIT_HOME: path.join(workspacePath, '.pre-commit-cache') },
+//     });
 
-    await ensureVenvIgnored(workspacePath);
+//     // verify hook file exists
+//     const hookPath = path.join(workspacePath, '.git', 'hooks', 'pre-commit');
+//     const hookExists = await checkPathExists(hookPath);
+//     if (!hookExists) {
+//       throw new Error('Hook script was not created at .git/hooks/pre-commit');
+//     }
+//     console.log(`CommitGuard: Verified hook file exists at ${hookPath}`);
 
-    // Ensure a pre-commit config exists (auto-create minimal + gitleaks)
-    const cfg = await ensurePreCommitConfig(workspacePath);
-    if (cfg.created) {
-      console.log(`CommitGuard: Created default pre-commit config at ${cfg.path}`);
-    } else {
-      console.log(`CommitGuard: Using existing pre-commit config at ${cfg.path}`);
-    }
+//     // PHASE 2: best-effort warm up environments (may fail if a hook needs extra deps)
+//     try {
+//       await execAsync(`"${preCommitBin}" install-hooks -t pre-commit`, {
+//         cwd: workspacePath,
+//         timeout: 180_000,
+//         env: { ...process.env, PRE_COMMIT_HOME: path.join(workspacePath, '.pre-commit-cache') },
+//       });
+//     } catch (e: any) {
+//       const detail = e?.stderr || e?.stdout || e?.message || String(e);
+//       console.warn('CommitGuard: install-hooks failed, continuing. Details:', detail);
+//       vscode.window.showWarningMessage(
+//         'CommitGuard: Hook installed. Installing hook environments failed; the first commit may build environments and could fail if prerequisites are missing.'
+//       );
+//     }
 
-    // Install hooks (phased) and warm up environments
-    await installPreCommitHooks(workspaceFolder, preCommitPathFromVenv);
+//     if (showTerminal) {
+//       const terminal = vscode.window.createTerminal({
+//         name: `CommitGuard: ${workspaceFolder.name}`,
+//         cwd: workspacePath,
+//       });
+//       terminal.sendText(`echo "✅ CommitGuard: Pre-commit hooks successfully installed!"`);
+//       terminal.sendText(`echo "Hooks are ready to run on your next commit."`);
+//       terminal.show(true);
+//     }
 
-    return {
-      workspace: workspaceFolder.name,
-      success: true,
-      message: cfg.created ? 'Hooks installed; default config created' : 'Hooks installed',
-    };
-  } catch (err: any) {
-    const detail = err?.message ?? String(err);
-    return {
-      workspace: workspaceFolder.name,
-      success: false,
-      message: detail,
-    };
-  }
-}
+//     console.log(`CommitGuard: Successfully installed and verified hooks for ${workspaceFolder.name}`);
+//   } catch (error) {
+//     const errorMessage = error instanceof Error ? error.message : 'Unknown error';
+//     console.error(`CommitGuard: Hook installation error:`, error);
+//     throw new Error(`Failed to install pre-commit hooks: ${errorMessage}`);
+//   }
+// }
 
-/**
- * Install pre-commit hooks with a two-phase strategy:
- * 1) Install the hook script ("install -t pre-commit") and verify its presence.
- * 2) Best-effort "install-hooks"; warn on failure but don't abort.
- */
 async function installPreCommitHooks(
   workspaceFolder: vscode.WorkspaceFolder,
   preCommitPathFromVenv?: string
@@ -314,17 +301,15 @@ async function installPreCommitHooks(
     const workspacePath = workspaceFolder.uri.fsPath;
     const env = { ...process.env, PRE_COMMIT_HOME: path.join(workspacePath, '.pre-commit-cache') };
 
-    // Prefer provided pre-commit path (from temp venv), else use local .venv pre-commit if present, else PATH
-    let preCommitBin = preCommitPathFromVenv;
-    if (!preCommitBin) {
-      const localCandidate = path.join(
+    // Use the venv’s pre-commit if provided; otherwise infer from .venv
+    const preCommitBin =
+      preCommitPathFromVenv ||
+      path.join(
         workspacePath,
         '.venv',
         process.platform === 'win32' ? 'Scripts' : 'bin',
         process.platform === 'win32' ? 'pre-commit.exe' : 'pre-commit'
       );
-      preCommitBin = (await checkPathExists(localCandidate)) ? localCandidate : 'pre-commit';
-    }
 
     console.log('CommitGuard: PHASED INSTALL MODE (no --install-hooks up front)');
 
@@ -332,7 +317,7 @@ async function installPreCommitHooks(
     await execAsync(`"${preCommitBin}" install -t pre-commit`, {
       cwd: workspacePath,
       timeout: 120_000,
-      env,
+      env
     });
 
     // Verify hook file exists
@@ -342,15 +327,15 @@ async function installPreCommitHooks(
     }
     console.log(`CommitGuard: Verified hook file exists at ${hookPath}`);
 
-    // PHASE 2 — best-effort warm-up of hook environments (reads the config we ensured)
+    // PHASE 2 — best-effort warm-up of hook environments
     try {
       await execAsync(`"${preCommitBin}" install-hooks`, {
         cwd: workspacePath,
         timeout: 180_000,
-        env,
+        env
       });
     } catch (e: any) {
-      const detail = e?.stderr ?? e?.stdout ?? e?.message ?? String(e);
+      const detail = e?.stderr || e?.stdout || e?.message || String(e);
       console.warn('CommitGuard: install-hooks failed, continuing. Details:', detail);
       vscode.window.showWarningMessage(
         'CommitGuard: Hook installed. Installing hook environments failed; the first commit may build environments and could fail if prerequisites are missing.'
@@ -360,7 +345,7 @@ async function installPreCommitHooks(
     if (showTerminal) {
       const terminal = vscode.window.createTerminal({
         name: `CommitGuard: ${workspaceFolder.name}`,
-        cwd: workspacePath,
+        cwd: workspacePath
       });
       terminal.sendText(`echo "✅ CommitGuard: Pre-commit hooks successfully installed!"`);
       terminal.sendText(`echo "Hooks are ready to run on your next commit."`);
@@ -373,55 +358,6 @@ async function installPreCommitHooks(
     console.error('CommitGuard: Hook installation error:', error);
     throw new Error(`Failed to install pre-commit hooks: ${errorMessage}`);
   }
-}
-
-/**
- * Ensure `.pre-commit-config.yaml` exists in repo root.
- * Creates a default config that includes:
- *  - basic hygiene hooks (pre-commit-hooks)
- *  - Gitleaks (secrets scanning)
- */
-async function ensurePreCommitConfig(
-  workspacePath: string
-): Promise<{ created: boolean; path: string }> {
-  const config = vscode.workspace.getConfiguration('commitGuard');
-  const autoCreate = config.get<boolean>('autoCreateConfigIfMissing', true);
-  const includeGitleaks = config.get<boolean>('includeGitleaks', true);
-  const gitleaksVersion = config.get<string>('gitleaksVersionPin', 'v8.28.0'); // pin for determinism
-
-  const yamlPath = path.join(workspacePath, '.pre-commit-config.yaml');
-  const ymlPath = path.join(workspacePath, '.pre-commit-config.yml');
-
-  if (await checkPathExists(yamlPath)) return { created: false, path: yamlPath };
-  if (await checkPathExists(ymlPath)) return { created: false, path: ymlPath };
-
-  if (!autoCreate) {
-    const choice = await vscode.window.showInformationMessage(
-      'CommitGuard: No .pre-commit-config.yaml found. Create a default config?',
-      'Create default',
-      'Not now'
-    );
-    if (choice !== 'Create default') {
-      return { created: false, path: yamlPath };
-    }
-  }
-
-  const baselineConfig = `repos:
-  - repo: https://github.com/pre-commit/pre-commit-hooks
-    rev: v4.6.0
-    hooks:
-      - id: trailing-whitespace
-      - id: end-of-file-fixer
-      - id: check-yaml
-      - id: check-merge-conflict
-${includeGitleaks ? `  - repo: https://github.com/gitleaks/gitleaks
-    rev: ${gitleaksVersion}
-    hooks:
-      - id: gitleaks
-` : ''}`;
-
-  await fs.writeFile(yamlPath, baselineConfig, { encoding: 'utf8' });
-  return { created: true, path: yamlPath };
 }
 
 /**
@@ -450,9 +386,10 @@ async function ensureVenvIgnored(workspacePath: string): Promise<void> {
 }
 
 /**
- * (Optional) Download and place a Gitleaks binary into a venv's bin/Scripts.
- * Not used by default; the pre-commit hook pulls gitleaks from its own repo.
- * Keep for air‑gapped or custom scenarios.
+ * Downloads and installs a Gitleaks binary into the venv's bin/Scripts folder.
+ * Returns the absolute path to the binary.
+ *
+ * We pin a stable Gitleaks version to keep behavior deterministic.
  */
 async function ensureGitleaksAvailable(venvPath: string): Promise<string> {
   const isWindows = process.platform === 'win32';
@@ -463,36 +400,40 @@ async function ensureGitleaksAvailable(venvPath: string): Promise<string> {
     return target;
   }
 
-  const version = 'v8.28.0';
+  // Choose asset by platform/arch
+  const version = 'v8.28.0'; // update periodically to keep rules fresh
   const base = `https://github.com/gitleaks/gitleaks/releases/download/${version}`;
   const arch = process.arch;
+
   let asset = '';
-
   if (isWindows) {
-    asset = 'gitleaks_8.28.0_windows_x64.zip';
+    asset = 'gitleaks_8.28.0_windows_x64.zip'; // assuming x64 corporate images
   } else if (process.platform === 'darwin') {
-    asset =
-      arch === 'arm64'
-        ? 'gitleaks_8.28.0_darwin_arm64.tar.gz'
-        : 'gitleaks_8.28.0_darwin_x64.tar.gz';
+    asset = arch === 'arm64'
+      ? 'gitleaks_8.28.0_darwin_arm64.tar.gz'
+      : 'gitleaks_8.28.0_darwin_x64.tar.gz';
   } else {
-    asset =
-      arch === 'arm64'
-        ? 'gitleaks_8.28.0_linux_arm64.tar.gz'
-        : 'gitleaks_8.28.0_linux_x64.tar.gz';
+    // linux
+    asset = arch === 'arm64'
+      ? 'gitleaks_8.28.0_linux_arm64.tar.gz'
+      : 'gitleaks_8.28.0_linux_x64.tar.gz';
   }
-
   const url = `${base}/${asset}`;
+
+  // Download to temp
   const tmpDir = path.join(os.tmpdir(), 'commitguard-gitleaks');
   await fs.mkdir(tmpDir, { recursive: true });
   const archivePath = path.join(tmpDir, asset);
   await downloadFile(url, archivePath);
 
+  // Extract using platform tools to avoid external libs
   if (isWindows) {
+    // Use PowerShell Expand-Archive
     await execAsync(
       `powershell -NoProfile -Command "Expand-Archive -Path '${archivePath}' -DestinationPath '${tmpDir}' -Force"`,
       { timeout: 120_000 }
     );
+    // The zip contains gitleaks.exe at the root in recent releases
     const exePath = path.join(tmpDir, 'gitleaks.exe');
     const nestedExe = (await checkPathExists(exePath))
       ? exePath
@@ -546,16 +487,22 @@ async function downloadFile(url: string, dest: string): Promise<void> {
 
 /**
  * Displays a summary of setup results to the user
+ * Shows different messages based on success/failure/skip status
+ *
+ * @param results - Array of setup results for all workspaces
+ * @param manualTrigger - Whether setup was manually triggered
  */
 function displaySetupSummary(results: SetupResult[], manualTrigger: boolean): void {
   const successful = results.filter((r) => r.success && !r.skipped);
-  const failed = results.filter((r) => !r.success && !r.skipped);
+  const failed = results.filter((r) => !r.success);
   const skipped = results.filter((r) => r.skipped);
 
+  // If everything was skipped and it's not manual, don't show any message
   if (skipped.length === results.length && !manualTrigger) {
     return;
   }
 
+  // Build summary message
   const messages: string[] = [];
   if (successful.length > 0) {
     messages.push(
@@ -577,6 +524,7 @@ function displaySetupSummary(results: SetupResult[], manualTrigger: boolean): vo
     );
   }
 
+  // Show appropriate message based on results
   if (failed.length > 0) {
     const viewDocsAction = 'View Documentation';
     vscode.window
@@ -589,81 +537,8 @@ function displaySetupSummary(results: SetupResult[], manualTrigger: boolean): vo
   } else if (successful.length > 0) {
     vscode.window.showInformationMessage(`CommitGuard: ${messages.join(' ')}`);
   } else if (manualTrigger) {
+    // Only show "nothing to do" message if manually triggered
     vscode.window.showInformationMessage(`CommitGuard: ${messages.join(' ')}`);
   }
-}
+}const pythonBin = process.platform === 'win32' ? path.join(venvPath, 'Scripts', 'python.exe') : path.join(venvPath, 'bin', 'python');
 
-/* ------------------------ Internal helpers ------------------------ */
-
-/**
- * Detect Python and version. Prefer python3, fallback to python.
- */
-async function getPythonInfo(): Promise<PythonInfo> {
-  const candidates = ['python3', 'python'];
-
-  for (const cmd of candidates) {
-    try {
-      const { stdout, stderr } = await execAsync(`"${cmd}" --version`);
-      const text = (stdout || stderr || '').trim();
-      if (text) {
-        return { available: true, command: cmd, version: text };
-      }
-    } catch {
-      // try next
-    }
-  }
-  return { available: false, command: '' };
-}
-
-/**
- * Creates a temporary venv and installs pre-commit into it.
- */
-async function setupVirtualEnvironment(pythonCmd: string, baseDir: string): Promise<VenvSetupResult> {
-  const venvPath = path.join(baseDir, 'commitguard-venv');
-  const isWin = process.platform === 'win32';
-  try {
-    // Create venv
-    await execAsync(`"${pythonCmd}" -m venv "${venvPath}"`, { timeout: 120_000 });
-
-    const pythonBin = isWin
-      ? path.join(venvPath, 'Scripts', 'python.exe')
-      : path.join(venvPath, 'bin', 'python');
-    const pipBin = isWin
-      ? path.join(venvPath, 'Scripts', 'pip.exe')
-      : path.join(venvPath, 'bin', 'pip');
-
-    // Upgrade pip and install pre-commit inside the venv
-    await execAsync(`"${pythonBin}" -m pip install --upgrade pip`, { timeout: 90_000 });
-    await execAsync(`"${pipBin}" install pre-commit`, { timeout: 180_000 });
-
-    const preCommitBin = isWin
-      ? path.join(venvPath, 'Scripts', 'pre-commit.exe')
-      : path.join(venvPath, 'bin', 'pre-commit');
-
-    if (!(await checkPathExists(preCommitBin))) {
-      return { success: false, venvPath, pythonBin, pipBin };
-    }
-    return { success: true, venvPath, pythonBin, pipBin, preCommitBin };
-  } catch (err) {
-    console.warn('CommitGuard: setupVirtualEnvironment failed:', err);
-    return {
-      success: false,
-      venvPath,
-      pythonBin: isWin ? path.join(venvPath, 'Scripts', 'python.exe') : path.join(venvPath, 'bin', 'python'),
-      pipBin: isWin ? path.join(venvPath, 'Scripts', 'pip.exe') : path.join(venvPath, 'bin', 'pip'),
-    };
-  }
-}
-
-/**
- * Cross-platform path existence check.
- */
-async function checkPathExists(p: string): Promise<boolean> {
-  try {
-    await fs.stat(p);
-    return true;
-  } catch {
-    return false;
-  }
-}
-``

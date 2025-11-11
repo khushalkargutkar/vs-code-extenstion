@@ -8,7 +8,7 @@ import * as https from 'https';
 import { createWriteStream } from 'fs';
 
 const execAsync = promisify(exec);
-
+let EXTENSION_ROOT = "";
 /**
  * Documentation URL for troubleshooting and additional information
  */
@@ -59,8 +59,33 @@ interface VenvSetupResult {
  * Activates the CommitGuard extension
  * Sets up pre-commit hooks across all workspace folders on startup
  */
+// export async function activate(context: vscode.ExtensionContext): Promise<void> {
+//   console.log('CommitGuard extension is now active');
+//   EXTENSION_ROOT = context.extensionPath;
+//   // Register the manual setup command
+//   const setupCommand = vscode.commands.registerCommand(
+//     'commitGuard.setupPreCommit',
+//     async () => {
+//       await setupPreCommitForAllWorkspaces(true);
+//     }
+//   );
+//   context.subscriptions.push(setupCommand);
+
+//   // Check if auto-setup is enabled
+//   const config = vscode.workspace.getConfiguration('commitGuard');
+//   const autoSetup = config.get<boolean>('autoSetupOnStartup', true);
+
+//   if (autoSetup) {
+//     console.log('CommitGuard: Running auto-setup on startup');
+//     await setupPreCommitForAllWorkspaces(false);
+//   } else {
+//     console.log('CommitGuard: Auto-setup is disabled in settings');
+//   }
+// }
+
 export async function activate(context: vscode.ExtensionContext): Promise<void> {
   console.log('CommitGuard extension is now active');
+  EXTENSION_ROOT = context.extensionPath;
 
   // Register the manual setup command
   const setupCommand = vscode.commands.registerCommand(
@@ -81,7 +106,31 @@ export async function activate(context: vscode.ExtensionContext): Promise<void> 
   } else {
     console.log('CommitGuard: Auto-setup is disabled in settings');
   }
+
+// ✅ Detect git init by watching file creation inside .git
+  const gitWatcher = vscode.workspace.createFileSystemWatcher("**/.git/**");
+
+  let gitInitTriggered = false;
+  let gitInitTimeout: NodeJS.Timeout | undefined;
+
+  gitWatcher.onDidCreate(async (uri) => {
+    if (gitInitTriggered) return; // prevent multiple runs
+
+    // Debounce: wait until git is done creating files
+    clearTimeout(gitInitTimeout as NodeJS.Timeout);
+
+    gitInitTimeout = setTimeout(async () => {
+      gitInitTriggered = true;
+      console.log("CommitGuard: Git init detected — triggering setup once.");
+      await setupPreCommitForAllWorkspaces(true); // pass manualTrigger = true to show summary only once
+
+
+    }, 600); // 🟢 debounce (sweet spot)
+  });
+
+  context.subscriptions.push(gitWatcher);
 }
+
 
 /**
  * Deactivates the extension
@@ -103,6 +152,18 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
     );
     return;
   }
+    // ✅ NEW: skip entire setup if no .git repo exists in any workspace
+  const hasGitRepo = await Promise.all(
+    workspaceFolders.map(folder =>
+      checkPathExists(path.join(folder.uri.fsPath, ".git"))
+    )
+  ).then(results => results.some(r => r));
+
+  if (!hasGitRepo) {
+    console.log("CommitGuard: No git repos detected — skipping setup.");
+    return; // prevents prereq checks and UI popups
+  }
+
 
   // Step 1: Ensure pre-commit is available (best-effort)
   console.log('CommitGuard: Checking for pre-commit installation...');
@@ -152,11 +213,23 @@ async function setupPreCommitForAllWorkspaces(manualTrigger: boolean): Promise<v
 
   // Step 2: Setup pre-commit for each workspace folder
   const results: SetupResult[] = [];
+  // for (const folder of workspaceFolders) {
+  //   const result = await setupPreCommitForWorkspace(folder, prereqResult.preCommitBinPath);
+  //   results.push(result);
+  // }
   for (const folder of workspaceFolders) {
-    const result = await setupPreCommitForWorkspace(folder, prereqResult.preCommitBinPath);
-    results.push(result);
+  const workspacePath = folder.uri.fsPath;
+  const gitDir = path.join(workspacePath, ".git");
+
+  // ✅ Skip this workspace entirely if not a git repo
+  if (!(await checkPathExists(gitDir))) {
+    console.log(`CommitGuard: Skipping workspace "${folder.name}" — no .git repo found.`);
+    continue;
   }
 
+  const result = await setupPreCommitForWorkspace(folder, prereqResult.preCommitBinPath);
+  results.push(result);
+}
   // Step 3: Show summary to user
   displaySetupSummary(results, manualTrigger);
 }
@@ -381,21 +454,96 @@ async function installPreCommitHooks(
  *  - basic hygiene hooks (pre-commit-hooks)
  *  - Gitleaks (secrets scanning)
  */
+
+// async function ensurePreCommitConfig(
+//   workspacePath: string
+// ): Promise<{ created: boolean; path: string }> {
+//   const config = vscode.workspace.getConfiguration('commitGuard');
+//   const autoCreate = config.get<boolean>('autoCreateConfigIfMissing', true);
+//   const includeGitleaks = config.get<boolean>('includeGitleaks', true);
+//   const gitleaksVersion = config.get<string>('gitleaksVersionPin', 'v8.28.0'); // pin for determinism
+
+//   const yamlPath = path.join(workspacePath, '.pre-commit-config.yaml');
+//   const ymlPath = path.join(workspacePath, '.pre-commit-config.yml');
+
+//   // ✅ Instead of returning if exists — we now ALWAYS overwrite
+//   const exists = (await checkPathExists(yamlPath)) || (await checkPathExists(ymlPath));
+
+//   if (!exists && !autoCreate) {
+//     const choice = await vscode.window.showInformationMessage(
+//       'CommitGuard: No .pre-commit-config.yaml found. Create a default config?',
+//       'Create default',
+//       'Not now'
+//     );
+//     if (choice !== 'Create default') {
+//       return { created: false, path: yamlPath };
+//     }
+//   }
+
+//   // Try read the bundled template from the extension root
+//   let finalYaml: string | undefined;
+//   try {
+//     const templatePath = path.join(EXTENSION_ROOT, '.pre-commit-config.yaml');
+//     finalYaml = await fs.readFile(templatePath, 'utf8');
+//   } catch {
+//     // Fallback to previous inline default to avoid hard failure if the file isn't packaged
+//     const fallback = `repos:
+//   - repo: https://github.com/pre-commit/pre-commit-hooks
+//     rev: v4.6.0
+//     hooks:
+//       - id: trailing-whitespace
+//       - id: end-of-file-fixer
+//       - id: check-yaml
+//       - id: check-merge-conflict
+// `;
+//     finalYaml = fallback;
+//   }
+
+//   if (includeGitleaks) {
+//     finalYaml += `
+//   - repo: https://github.com/gitleaks/gitleaks
+//     rev: ${gitleaksVersion}
+//     hooks:
+//       - id: gitleaks
+// `;
+//   }
+
+//   await fs.writeFile(yamlPath, finalYaml, { encoding: 'utf8' });
+
+//   // ✅ Only refresh when config was freshly created
+//   const created = !exists;
+//   if (created) {
+//     try {
+//       await execAsync("pre-commit migrate-config", { cwd: workspacePath });
+//       await execAsync("pre-commit install --overwrite", { cwd: workspacePath });
+//       console.log("CommitGuard: Pre-commit hook installed / updated.");
+//     } catch (error) {
+//       console.error("CommitGuard: Failed to refresh pre-commit hook.", error);
+//     }
+//   }
+
+// return { created, path: yamlPath };
+
+
+//   return { created: !exists, path: yamlPath };
+// }
+
 async function ensurePreCommitConfig(
   workspacePath: string
 ): Promise<{ created: boolean; path: string }> {
   const config = vscode.workspace.getConfiguration('commitGuard');
   const autoCreate = config.get<boolean>('autoCreateConfigIfMissing', true);
   const includeGitleaks = config.get<boolean>('includeGitleaks', true);
-  const gitleaksVersion = config.get<string>('gitleaksVersionPin', 'v8.28.0'); // pin for determinism
+  const gitleaksVersion = config.get<string>('gitleaksVersionPin', 'v8.28.0');
 
   const yamlPath = path.join(workspacePath, '.pre-commit-config.yaml');
   const ymlPath = path.join(workspacePath, '.pre-commit-config.yml');
 
-  if (await checkPathExists(yamlPath)) return { created: false, path: yamlPath };
-  if (await checkPathExists(ymlPath)) return { created: false, path: ymlPath };
+  // ✅ detect whether config already existed
+  const existed =
+    (await checkPathExists(yamlPath)) || (await checkPathExists(ymlPath));
 
-  if (!autoCreate) {
+  if (!existed && !autoCreate) {
     const choice = await vscode.window.showInformationMessage(
       'CommitGuard: No .pre-commit-config.yaml found. Create a default config?',
       'Create default',
@@ -406,7 +554,13 @@ async function ensurePreCommitConfig(
     }
   }
 
-  const baselineConfig = `repos:
+  // Load template from extension bundle
+  let finalYaml: string;
+  try {
+    const templatePath = path.join(EXTENSION_ROOT, '.pre-commit-config.yaml');
+    finalYaml = await fs.readFile(templatePath, 'utf8');
+  } catch {
+    finalYaml = `repos:
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
@@ -414,14 +568,36 @@ async function ensurePreCommitConfig(
       - id: end-of-file-fixer
       - id: check-yaml
       - id: check-merge-conflict
-${includeGitleaks ? `  - repo: https://github.com/gitleaks/gitleaks
+`;
+  }
+
+  if (includeGitleaks) {
+    finalYaml += `
+  - repo: https://github.com/gitleaks/gitleaks
     rev: ${gitleaksVersion}
     hooks:
       - id: gitleaks
-` : ''}`;
+`;
+  }
 
-  await fs.writeFile(yamlPath, baselineConfig, { encoding: 'utf8' });
-  return { created: true, path: yamlPath };
+  // ✅ Only overwrite file if new or changed
+  await fs.writeFile(yamlPath, finalYaml, { encoding: 'utf8' });
+
+  const created = !existed;
+
+  if (created) {
+    try {
+      await execAsync(`python -m pre_commit migrate-config`, { cwd: workspacePath });
+      await execAsync(`python -m pre_commit install --overwrite`, {
+        cwd: workspacePath,
+      });
+      console.log('CommitGuard: Installed/updated pre-commit hook.');
+    } catch (error) {
+      console.error('CommitGuard: Failed to refresh pre-commit hook.', error);
+    }
+  }
+
+  return { created, path: yamlPath };
 }
 
 /**

@@ -1,0 +1,49 @@
+repos:
+  # General hygiene hooks
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+        stages: [pre-commit]
+      - id: end-of-file-fixer
+        stages: [pre-commit]
+      - id: check-yaml
+        stages: [pre-commit]
+      - id: check-json
+        stages: [pre-commit]
+      - id: check-added-large-files
+        args: ["--maxkb=1000"]
+        stages: [pre-commit]
+      - id: detect-private-key
+        stages: [pre-commit]
+
+  # Secret scanning
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.18.0
+    hooks:
+      - id: gitleaks
+        stages: [pre-commit]
+
+  # .NET formatting, build, test
+  - repo: local
+    hooks:
+      - id: dotnet-format
+        name: dotnet format
+        entry: dotnet format --verify-no-changes
+        language: system
+        files: \.(cs|csproj|sln)$
+        stages: [pre-commit]
+
+      - id: dotnet-build
+        name: dotnet build
+        entry: dotnet build --no-restore --nologo
+        language: system
+        files: \.(cs|csproj|sln)$
+        stages: [pre-commit]
+
+      - id: dotnet-test
+        name: dotnet test
+        entry: dotnet test --no-build --verbosity quiet
+        language: system
+        files: \.(cs|csproj|sln)$
+        stages: [pre-commit]

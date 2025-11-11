@@ -79,5 +79,12 @@
     "type": "git",
     "url": "https://github.com/your-organization/commitguard"
   },
+  "files": [
+  "out",
+  "src",
+  ".pre-commit-config.yaml",
+  "package.json",
+  "tsconfig.json"
+  ],
   "license": "MIT"
 }

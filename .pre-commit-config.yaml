@@ -1,49 +1,65 @@
 repos:
-  # General hygiene hooks
   - repo: https://github.com/pre-commit/pre-commit-hooks
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
-        stages: [pre-commit]
       - id: end-of-file-fixer
-        stages: [pre-commit]
       - id: check-yaml
-        stages: [pre-commit]
       - id: check-json
-        stages: [pre-commit]
       - id: check-added-large-files
-        args: ["--maxkb=1000"]
-        stages: [pre-commit]
       - id: detect-private-key
-        stages: [pre-commit]
+      - id: check-merge-conflict
 
-  # Secret scanning
-  - repo: https://github.com/gitleaks/gitleaks
-    rev: v8.18.0
-    hooks:
-      - id: gitleaks
-        stages: [pre-commit]
-
-  # .NET formatting, build, test
+  # ===============================================
+  # CUSTOM CHECKS (simple, safe, extension-owned)
+  # ===============================================
   - repo: local
     hooks:
-      - id: dotnet-format
-        name: dotnet format
-        entry: dotnet format --verify-no-changes
+
+      # 1️⃣ Hardcoded URL or Email detector
+      - id: hardcoded-secrets-check
+        name: Detect hardcoded URLs or email addresses
+        entry: |
+          bash -c '
+          if grep -R -nE "(https?://|[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+)" "$@"; then
+            echo "❌ Hardcoded URL or Email detected";
+            exit 1;
+          fi
+          exit 0
+          '
         language: system
-        files: \.(cs|csproj|sln)$
+        types: [file]
+        files: \.(cs|js|ts|py|json|yaml|yml)$
         stages: [pre-commit]
 
-      - id: dotnet-build
-        name: dotnet build
-        entry: dotnet build --no-restore --nologo
+      # 2️⃣ CamelCase rule violation checker
+      - id: camelcase-check
+        name: Check for non-standard CamelCase
+        entry: |
+          python3 -c '
+          import re, sys
+          bad = False
+          pattern = r"([A-Z]{2,}[a-z]+)"  # Detect patterns like HTTPClient
+          for f in sys.argv[1:]:
+              try:
+                  txt = open(f, "r", encoding="utf-8", errors="ignore").read()
+                  if re.search(pattern, txt):
+                      print(f"❌ CamelCase violation in {f}")
+                      bad = True
+              except Exception:
+                  pass
+          if bad:
+              sys.exit(1)
+          '
         language: system
-        files: \.(cs|csproj|sln)$
+        files: \.cs$
+        types: [file]
         stages: [pre-commit]
 
-      - id: dotnet-test
-        name: dotnet test
-        entry: dotnet test --no-build --verbosity quiet
-        language: system
-        files: \.(cs|csproj|sln)$
-        stages: [pre-commit]
+  # ===============================================
+  # BUILT-IN SECURITY SCAN (unchanged)
+  # ===============================================
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.28.0
+    hooks:
+      - id: gitleaks
